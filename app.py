@@ -7,6 +7,7 @@ import onnxruntime as ort
 from PIL import Image
 import logging
 import os
+import cv2
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -23,7 +24,7 @@ async def lifespan(app: FastAPI):
         # Cargar el modelo ONNX
         model_path = os.environ.get("MODEL_PATH", "model/bird_classifier.onnx")
         logger.info(f"Cargando modelo desde: {model_path}")
-        model = BirdClassifier(model_path)
+        model = BirdDetector(model_path)
         logger.info("Modelo cargado y listo para inferencia")
     except Exception as e:
         logger.error(f"Error al cargar el modelo: {str(e)}")
@@ -49,27 +50,48 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Clase para el clasificador
-class BirdClassifier:
+# Clase para el detector de aves (YOLO)
+class BirdDetector:
     def __init__(self, model_path):
         try:
+            # Obtener proveedores disponibles
+            available_providers = ort.get_available_providers()
+            logger.info(f"Proveedores ONNX disponibles: {available_providers}")
+            
+            # Seleccionar proveedores adecuados
+            providers = ['CPUExecutionProvider']
+            
             # Optimizar para servidor
             session_options = ort.SessionOptions()
             session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
             
-            # Inicializar la sesión
-            self.session = ort.InferenceSession(model_path, session_options)
+            # Inicializar la sesión con proveedores explícitos
+            self.session = ort.InferenceSession(
+                model_path, 
+                sess_options=session_options,
+                providers=providers
+            )
             
             # Obtener metadatos
-            self.input_name = self.session.get_inputs()[0].name
-            self.output_name = self.session.get_outputs()[0].name
-            self.input_shape = self.session.get_inputs()[0].shape
+            self.inputs = self.session.get_inputs()
+            self.outputs = self.session.get_outputs()
+            self.input_name = self.inputs[0].name
+            
+            # Determinar la forma de entrada
+            self.input_shape = self.inputs[0].shape
+            self.img_size = 640  # Tamaño por defecto para YOLO
+            if len(self.input_shape) >= 4:
+                if self.input_shape[2] > 0 and self.input_shape[3] > 0:
+                    self.img_size = self.input_shape[2]  # Asumiendo que es cuadrado
+            
+            logger.info(f"Tamaño de imagen para el modelo: {self.img_size}x{self.img_size}")
             
             # Cargar etiquetas
             self.labels_path = os.environ.get("LABELS_PATH", "model/bird_labels.txt")
             self.load_labels()
             
             logger.info(f"Modelo cargado. Forma de entrada: {self.input_shape}")
+            logger.info(f"Usando proveedores: {providers}")
         except Exception as e:
             logger.error(f"Error en la inicialización: {str(e)}")
             raise e
@@ -78,56 +100,89 @@ class BirdClassifier:
         try:
             with open(self.labels_path, 'r') as f:
                 self.labels = [line.strip() for line in f.readlines()]
+            logger.info(f"Etiquetas cargadas: {len(self.labels)} especies")
         except Exception as e:
             logger.warning(f"No se pudieron cargar las etiquetas: {str(e)}")
             # Etiquetas de respaldo
             self.labels = ["especie_desconocida"]
     
     def preprocess_image(self, image):
-        # Redimensionar
-        target_size = (224, 224)
-        if self.input_shape and len(self.input_shape) >= 3:
-            if self.input_shape[2] > 0 and self.input_shape[3] > 0:
-                target_size = (self.input_shape[2], self.input_shape[3])
-        
-        image = image.resize(target_size)
-        
-        # Convertir a RGB
-        if image.mode != "RGB":
-            image = image.convert("RGB")
-        
-        # Normalizar
-        img_array = np.array(image).astype(np.float32) / 255.0
-        
-        # Reorganizar a NCHW
-        img_array = np.transpose(img_array, (2, 0, 1))
-        
-        # Añadir dimensión de lote
-        img_array = np.expand_dims(img_array, axis=0)
-        
-        return img_array
-    
-    def predict(self, image):
         try:
-            input_data = self.preprocess_image(image)
-            inputs = {self.input_name: input_data}
-            outputs = self.session.run([self.output_name], inputs)
-            predictions = outputs[0][0]
+            # Convertir PIL Image a numpy array
+            img = np.array(image)
             
-            # Top 5 predicciones
-            top_indices = np.argsort(predictions)[::-1][:5]
+            # Convertir a BGR (OpenCV format) si es RGB
+            if len(img.shape) == 3 and img.shape[2] == 3:
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
             
+            # Redimensionar y preparar para YOLO
+            img = cv2.resize(img, (self.img_size, self.img_size))
+            
+            # Normalizar y convertir a formato NCHW
+            img = img.astype(np.float32) / 255.0
+            img = img.transpose(2, 0, 1)  # HWC -> CHW
+            img = np.expand_dims(img, axis=0)  # Añadir dimensión de lote
+            
+            return img
+        except Exception as e:
+            logger.error(f"Error en el preprocesamiento: {str(e)}")
+            raise e
+    
+    def postprocess(self, outputs, conf_threshold=0.25, iou_threshold=0.45):
+        try:
+            # Extraer las detecciones
+            predictions = outputs[0]  # Asumiendo que el primer output contiene las detecciones
+            
+            # Filtrar por confianza
             results = []
-            for idx in top_indices:
-                if idx < len(self.labels):
-                    results.append({
-                        "species": self.labels[idx],
-                        "confidence": float(predictions[idx])
-                    })
+            
+            # Procesar las predicciones según el formato de salida de YOLO
+            # Este código puede necesitar ajustes según la estructura exacta de salida de tu modelo
+            for i, pred in enumerate(predictions):
+                if len(pred.shape) == 2:  # Formato [detecciones, (x, y, w, h, conf, cls1, cls2, ...)]
+                    for detection in pred:
+                        if len(detection) >= 6:  # Asegurarse de que hay suficientes elementos
+                            confidence = detection[4]
+                            if confidence >= conf_threshold:
+                                class_id = int(detection[5])
+                                if class_id < len(self.labels):
+                                    results.append({
+                                        "species": self.labels[class_id],
+                                        "confidence": float(confidence)
+                                    })
+                elif len(pred.shape) == 3:  # Otro posible formato
+                    # Implementar según sea necesario
+                    pass
+            
+            # Ordenar por confianza
+            results = sorted(results, key=lambda x: x["confidence"], reverse=True)
+            
+            # Limitar a las 5 mejores predicciones
+            return results[:5]
+        except Exception as e:
+            logger.error(f"Error en el postprocesamiento: {str(e)}")
+            raise e
+    
+    def detect(self, image):
+        try:
+            # Preprocesar la imagen
+            input_data = self.preprocess_image(image)
+            
+            # Ejecutar inferencia
+            logger.info("Ejecutando inferencia YOLO...")
+            outputs = self.session.run(None, {self.input_name: input_data})
+            
+            # Postprocesar resultados
+            results = self.postprocess(outputs)
+            
+            if results:
+                logger.info(f"Detección completada. Top resultado: {results[0]['species']} ({results[0]['confidence']:.4f})")
+            else:
+                logger.info("No se detectaron aves en la imagen")
             
             return results
         except Exception as e:
-            logger.error(f"Error durante la inferencia: {str(e)}")
+            logger.error(f"Error durante la detección: {str(e)}")
             raise e
 
 # ENDPOINT RAÍZ - Crucial para verificar que la API está funcionando
@@ -150,6 +205,7 @@ async def detect_bird(file: UploadFile = File(...)):
     global model
     
     if model is None:
+        logger.error("Solicitud de detección pero el modelo no está cargado")
         raise HTTPException(status_code=503, detail="Modelo no disponible")
     
     try:
@@ -158,14 +214,16 @@ async def detect_bird(file: UploadFile = File(...)):
         if not content_type.startswith("image/"):
             raise HTTPException(status_code=400, detail="El archivo debe ser una imagen")
         
+        logger.info(f"Procesando imagen: {file.filename}, tipo: {content_type}")
+        
         # Leer la imagen
         contents = await file.read()
         
         # Procesar la imagen
         image = Image.open(io.BytesIO(contents))
         
-        # Realizar la predicción
-        results = model.predict(image)
+        # Realizar la detección
+        results = model.detect(image)
         
         return {
             "predictions": results
@@ -180,13 +238,14 @@ async def health_check():
     """Verificar el estado de la API"""
     global model
     
-    status = "healthy" if model is not None else "model_not_loaded"
+    status = "online" if model is not None else "model_not_loaded"
     
     return {
         "status": status,
         "model_info": {
             "loaded": model is not None,
             "input_shape": model.input_shape if model else None,
+            "img_size": model.img_size if model else None,
             "num_species": len(model.labels) if model else 0
         }
     }
