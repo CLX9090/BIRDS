@@ -1,39 +1,42 @@
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 import io
 import numpy as np
 import onnxruntime as ort
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
-import uvicorn
-from contextlib import asynccontextmanager
+from PIL import Image
+import logging
+import os
 
-# Variable global para almacenar el modelo
+# Configurar logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Variable global para el modelo
 model = None
 
-# Definir el gestor de lifespan (reemplaza on_event)
+# Gestor del ciclo de vida
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Código que se ejecuta al iniciar
     global model
     try:
-        # Reemplaza 'model.onnx' con la ruta a tu modelo
-        model_path = "modelo.onnx"
-        model = ONNXModel(model_path)
-        print("Modelo cargado y listo para inferencia")
+        # Cargar el modelo ONNX
+        model_path = os.environ.get("MODEL_PATH", "model/bird_classifier.onnx")
+        logger.info(f"Cargando modelo desde: {model_path}")
+        model = BirdClassifier(model_path)
+        logger.info("Modelo cargado y listo para inferencia")
     except Exception as e:
-        print(f"Error al cargar el modelo: {str(e)}")
-        # El servidor iniciará, pero el modelo no estará disponible
+        logger.error(f"Error al cargar el modelo: {str(e)}")
     
-    yield  # Esto es donde la aplicación se ejecuta
+    yield
     
-    # Código que se ejecuta al cerrar (opcional)
-    print("Cerrando la aplicación")
+    logger.info("Cerrando la aplicación")
 
-# Inicializar FastAPI con el gestor de lifespan
+# Inicializar FastAPI
 app = FastAPI(
-    title="ONNX Model API", 
-    description="API para inferencia de modelos ONNX",
+    title="Bird Species Detection API",
+    description="API para detectar especies de aves a partir de imágenes",
+    version="1.0.0",
     lifespan=lifespan
 )
 
@@ -46,158 +49,144 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Clase para almacenar la sesión de ONNX Runtime
-class ONNXModel:
+# Clase para el clasificador
+class BirdClassifier:
     def __init__(self, model_path):
-        """
-        Inicializa la sesión de ONNX Runtime
-        
-        Args:
-            model_path: Ruta al archivo del modelo ONNX
-        """
         try:
-            # Crear opciones de sesión para optimizar el rendimiento
+            # Optimizar para servidor
             session_options = ort.SessionOptions()
             session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
             
-            # Inicializar la sesión de inferencia
+            # Inicializar la sesión
             self.session = ort.InferenceSession(model_path, session_options)
             
-            # Obtener metadatos del modelo
+            # Obtener metadatos
             self.input_name = self.session.get_inputs()[0].name
             self.output_name = self.session.get_outputs()[0].name
-            
-            # Obtener información sobre la forma de entrada
             self.input_shape = self.session.get_inputs()[0].shape
-            self.input_type = self.session.get_inputs()[0].type
             
-            print(f"Modelo cargado con éxito. Forma de entrada: {self.input_shape}, Tipo: {self.input_type}")
+            # Cargar etiquetas
+            self.labels_path = os.environ.get("LABELS_PATH", "model/bird_labels.txt")
+            self.load_labels()
+            
+            logger.info(f"Modelo cargado. Forma de entrada: {self.input_shape}")
         except Exception as e:
-            print(f"Error al cargar el modelo: {str(e)}")
+            logger.error(f"Error en la inicialización: {str(e)}")
             raise e
     
-    def predict(self, input_data):
-        """
-        Realiza una predicción con el modelo ONNX
-        
-        Args:
-            input_data: Datos de entrada en formato numpy
-            
-        Returns:
-            Resultado de la predicción
-        """
+    def load_labels(self):
         try:
-            # Crear diccionario de entrada para la sesión
-            inputs = {self.input_name: input_data}
-            
-            # Ejecutar la inferencia
-            outputs = self.session.run([self.output_name], inputs)
-            
-            return outputs[0]
+            with open(self.labels_path, 'r') as f:
+                self.labels = [line.strip() for line in f.readlines()]
         except Exception as e:
-            print(f"Error durante la inferencia: {str(e)}")
-            raise e
-
-# Modelo de datos para la entrada JSON
-class PredictionInput(BaseModel):
-    data: List[List[float]]
-    shape: Optional[List[int]] = None
-
-# Modelo de datos para la respuesta
-class PredictionResponse(BaseModel):
-    prediction: List
-    shape: List[int]
-
-@app.post("/predict", response_model=PredictionResponse)
-async def predict(input_data: PredictionInput):
-    """
-    Endpoint para realizar predicciones con datos JSON
-    """
-    global model
+            logger.warning(f"No se pudieron cargar las etiquetas: {str(e)}")
+            # Etiquetas de respaldo
+            self.labels = ["especie_desconocida"]
     
-    if model is None:
-        raise HTTPException(status_code=503, detail="Modelo no disponible")
-    
-    try:
-        # Convertir los datos de entrada a numpy array
-        np_data = np.array(input_data.data, dtype=np.float32)
+    def preprocess_image(self, image):
+        # Redimensionar
+        target_size = (224, 224)
+        if self.input_shape and len(self.input_shape) >= 3:
+            if self.input_shape[2] > 0 and self.input_shape[3] > 0:
+                target_size = (self.input_shape[2], self.input_shape[3])
         
-        # Reshape si se proporciona una forma específica
-        if input_data.shape:
-            np_data = np_data.reshape(input_data.shape)
+        image = image.resize(target_size)
         
-        # Realizar la predicción
-        result = model.predict(np_data)
+        # Convertir a RGB
+        if image.mode != "RGB":
+            image = image.convert("RGB")
         
-        # Convertir el resultado a lista para la respuesta JSON
-        prediction_list = result.tolist()
-        
-        return {
-            "prediction": prediction_list,
-            "shape": list(result.shape)
-        }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error en la predicción: {str(e)}")
-
-@app.post("/predict/image")
-async def predict_image(file: UploadFile = File(...)):
-    """
-    Endpoint para realizar predicciones con imágenes
-    """
-    global model
-    
-    if model is None:
-        raise HTTPException(status_code=503, detail="Modelo no disponible")
-    
-    try:
-        # Leer la imagen
-        contents = await file.read()
-        
-        # Procesar la imagen (ejemplo básico - ajustar según tu modelo)
-        # Aquí deberías usar bibliotecas como PIL o OpenCV para el preprocesamiento real
-        import numpy as np
-        from PIL import Image
-        
-        image = Image.open(io.BytesIO(contents))
-        # Redimensionar según los requisitos del modelo
-        # Suponiendo que el modelo espera imágenes de 224x224
-        image = image.resize((224, 224))
-        # Convertir a array y normalizar
+        # Normalizar
         img_array = np.array(image).astype(np.float32) / 255.0
-        # Reorganizar a NCHW si es necesario (para modelos entrenados con frameworks como PyTorch)
+        
+        # Reorganizar a NCHW
         img_array = np.transpose(img_array, (2, 0, 1))
+        
         # Añadir dimensión de lote
         img_array = np.expand_dims(img_array, axis=0)
         
-        # Realizar la predicción
-        result = model.predict(img_array)
-        
-        # Convertir el resultado a lista para la respuesta JSON
-        prediction_list = result.tolist()
-        
-        return {
-            "prediction": prediction_list,
-            "shape": list(result.shape)
-        }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error en la predicción: {str(e)}")
+        return img_array
+    
+    def predict(self, image):
+        try:
+            input_data = self.preprocess_image(image)
+            inputs = {self.input_name: input_data}
+            outputs = self.session.run([self.output_name], inputs)
+            predictions = outputs[0][0]
+            
+            # Top 5 predicciones
+            top_indices = np.argsort(predictions)[::-1][:5]
+            
+            results = []
+            for idx in top_indices:
+                if idx < len(self.labels):
+                    results.append({
+                        "species": self.labels[idx],
+                        "confidence": float(predictions[idx])
+                    })
+            
+            return results
+        except Exception as e:
+            logger.error(f"Error durante la inferencia: {str(e)}")
+            raise e
 
-@app.get("/model/info")
-async def model_info():
-    """
-    Endpoint para obtener información sobre el modelo cargado
-    """
+# ENDPOINT RAÍZ - Crucial para verificar que la API está funcionando
+@app.get("/")
+async def root():
+    """Endpoint de bienvenida"""
+    return {
+        "message": "API de detección de especies de aves",
+        "status": "online",
+        "endpoints": {
+            "/detect": "POST - Detectar especies de aves en una imagen",
+            "/health": "GET - Verificar el estado de la API"
+        }
+    }
+
+# Endpoint para detección
+@app.post("/detect")
+async def detect_bird(file: UploadFile = File(...)):
+    """Detecta especies de aves en una imagen"""
     global model
     
     if model is None:
         raise HTTPException(status_code=503, detail="Modelo no disponible")
     
-    return {
-        "input_shape": model.input_shape,
-        "input_type": model.input_type,
-        "status": "loaded"
-    }
+    try:
+        # Verificar que el archivo es una imagen
+        content_type = file.content_type
+        if not content_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail="El archivo debe ser una imagen")
+        
+        # Leer la imagen
+        contents = await file.read()
+        
+        # Procesar la imagen
+        image = Image.open(io.BytesIO(contents))
+        
+        # Realizar la predicción
+        results = model.predict(image)
+        
+        return {
+            "predictions": results
+        }
+    except Exception as e:
+        logger.error(f"Error en la detección: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error en el procesamiento: {str(e)}")
 
-if __name__ == "__main__":
-    # Ejecutar el servidor con uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+# Endpoint de health check
+@app.get("/health")
+async def health_check():
+    """Verificar el estado de la API"""
+    global model
+    
+    status = "healthy" if model is not None else "model_not_loaded"
+    
+    return {
+        "status": status,
+        "model_info": {
+            "loaded": model is not None,
+            "input_shape": model.input_shape if model else None,
+            "num_species": len(model.labels) if model else 0
+        }
+    }
