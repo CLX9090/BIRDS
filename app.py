@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import io
 import numpy as np
-import onnxruntime as ort
 from PIL import Image
 import logging
 import os
@@ -54,44 +53,12 @@ app.add_middleware(
 class BirdDetector:
     def __init__(self, model_path):
         try:
-            # Obtener proveedores disponibles
-            available_providers = ort.get_available_providers()
-            logger.info(f"Proveedores ONNX disponibles: {available_providers}")
-            
-            # Seleccionar proveedores adecuados
-            providers = ['CPUExecutionProvider']
-            
-            # Optimizar para servidor
-            session_options = ort.SessionOptions()
-            session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            
-            # Inicializar la sesión con proveedores explícitos
-            self.session = ort.InferenceSession(
-                model_path, 
-                sess_options=session_options,
-                providers=providers
-            )
-            
-            # Obtener metadatos
-            self.inputs = self.session.get_inputs()
-            self.outputs = self.session.get_outputs()
-            self.input_name = self.inputs[0].name
-            
-            # Determinar la forma de entrada
-            self.input_shape = self.inputs[0].shape
-            self.img_size = 640  # Tamaño por defecto para YOLO
-            if len(self.input_shape) >= 4:
-                if self.input_shape[2] > 0 and self.input_shape[3] > 0:
-                    self.img_size = self.input_shape[2]  # Asumiendo que es cuadrado
-            
-            logger.info(f"Tamaño de imagen para el modelo: {self.img_size}x{self.img_size}")
+            self.net = cv2.dnn.readNetFromONNX("./model/bird_classifier.onnx")
             
             # Cargar etiquetas
             self.labels_path = os.environ.get("LABELS_PATH", "model/bird_labels.txt")
             self.load_labels()
-            
-            logger.info(f"Modelo cargado. Forma de entrada: {self.input_shape}")
-            logger.info(f"Usando proveedores: {providers}")
+        
         except Exception as e:
             logger.error(f"Error en la inicialización: {str(e)}")
             raise e
@@ -104,83 +71,49 @@ class BirdDetector:
         except Exception as e:
             logger.warning(f"No se pudieron cargar las etiquetas: {str(e)}")
             # Etiquetas de respaldo
-            self.labels = ["especie_desconocida"]
+            self.labels = []
     
     def preprocess_image(self, image):
         try:
-            # Convertir PIL Image a numpy array
-            img = np.array(image)
-            
-            # Convertir a BGR (OpenCV format) si es RGB
-            if len(img.shape) == 3 and img.shape[2] == 3:
-                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-            
-            # Redimensionar y preparar para YOLO
-            img = cv2.resize(img, (self.img_size, self.img_size))
-            
-            # Normalizar y convertir a formato NCHW
-            img = img.astype(np.float32) / 255.0
-            img = img.transpose(2, 0, 1)  # HWC -> CHW
-            img = np.expand_dims(img, axis=0)  # Añadir dimensión de lote
-            
+
+            img = cv2.imdecode(np.array(image), -1)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img = cv2.resize(img,(640,640))
+            img = img.transpose(2,0,1)
+            img = img.reshape(1,3,640,640)
+            img = img/255.0
             return img
         except Exception as e:
             logger.error(f"Error en el preprocesamiento: {str(e)}")
             raise e
-    
-    def postprocess(self, outputs, conf_threshold=0.25, iou_threshold=0.45):
-        try:
-            # Extraer las detecciones
-            predictions = outputs[0]  # Asumiendo que el primer output contiene las detecciones
-            
-            # Filtrar por confianza
-            results = []
-            
-            # Procesar las predicciones según el formato de salida de YOLO
-            # Este código puede necesitar ajustes según la estructura exacta de salida de tu modelo
-            for i, pred in enumerate(predictions):
-                if len(pred.shape) == 2:  # Formato [detecciones, (x, y, w, h, conf, cls1, cls2, ...)]
-                    for detection in pred:
-                        if len(detection) >= 6:  # Asegurarse de que hay suficientes elementos
-                            confidence = detection[4]
-                            if confidence >= conf_threshold:
-                                class_id = int(detection[5])
-                                if class_id < len(self.labels):
-                                    results.append({
-                                        "species": self.labels[class_id],
-                                        "confidence": float(confidence)
-                                    })
-                elif len(pred.shape) == 3:  # Otro posible formato
-                    # Implementar según sea necesario
-                    pass
-            
-            # Ordenar por confianza
-            results = sorted(results, key=lambda x: x["confidence"], reverse=True)
-            
-            # Limitar a las 5 mejores predicciones
-            return results[:5]
-        except Exception as e:
-            logger.error(f"Error en el postprocesamiento: {str(e)}")
-            raise e
-    
     def detect(self, image):
         try:
-            # Preprocesar la imagen
-            input_data = self.preprocess_image(image)
-            
-            # Ejecutar inferencia
-            logger.info("Ejecutando inferencia YOLO...")
-            outputs = self.session.run(None, {self.input_name: input_data})
-            
-            # Postprocesar resultados
-            results = self.postprocess(outputs)
-            
-            if results:
-                logger.info(f"Detección completada. Top resultado: {results[0]['species']} ({results[0]['confidence']:.4f})")
+            self.net.setInput(image)
+            out = self.net.forward()
+            results = out[0]
+            results = results.transpose()
+            A = []
+            for detection in results:
+                class_id = detection[4:].argmax()
+                confidence_score = detection[4:].max()
+                new_detection = np.append(detection[:4],[class_id,confidence_score])
+                A.append(new_detection)
+                considerable_detections = [detection for detection in A if detection[-1] > 0.6]
+                considerable_detections = np.array(considerable_detections)
+            A = np.array(A)
+            results = []
+            species = []
+            for detection in considerable_detections:
+                if self.labels[int(detection[4])] not in species:
+                    results.append({"species":self.labels[int(detection[4])], "confidence":round(float(detection[5]),3)})
+                    species.append(self.labels[int(detection[4])])
+                else:
+                    pass
+            if len(results) >= 1:
+                return results
             else:
                 logger.info("No se detectaron aves en la imagen")
-            
-            return results
+                return "No se detectaron aves en la imagen"
         except Exception as e:
             logger.error(f"Error durante la detección: {str(e)}")
             raise e
@@ -219,12 +152,11 @@ async def detect_bird(file: UploadFile = File(...)):
         # Leer la imagen
         contents = await file.read()
         
-        # Procesar la imagen
-        image = Image.open(io.BytesIO(contents))
-        
-        # Realizar la detección
-        results = model.detect(image)
-        
+        # Procesar la image
+        contents = np.asarray(bytearray(contents), dtype="uint8")
+        preprocess = model.preprocess_image(contents)
+        results = model.detect(preprocess)
+        print(results)
         return {
             "predictions": results
         }
@@ -244,8 +176,6 @@ async def health_check():
         "status": status,
         "model_info": {
             "loaded": model is not None,
-            "input_shape": model.input_shape if model else None,
-            "img_size": model.img_size if model else None,
             "num_species": len(model.labels) if model else 0
         }
     }
