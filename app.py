@@ -156,10 +156,12 @@ async def detect_bird(file: UploadFile = File(...)):
         contents = np.asarray(bytearray(contents), dtype="uint8")
         preprocess = model.preprocess_image(contents)
         results = model.detect(preprocess)
-        print(results)
-        return {
-            "predictions": results
-        }
+        if results != "No se detectaron aves en la imagen":
+            return {
+                "predictions": results
+            }
+        else:
+            return "No se detectaron aves en la imagen"
     except Exception as e:
         logger.error(f"Error en la detección: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error en el procesamiento: {str(e)}")
