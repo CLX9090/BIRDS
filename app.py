@@ -98,7 +98,7 @@ class BirdDetector:
                 confidence_score = detection[4:].max()
                 new_detection = np.append(detection[:4],[class_id,confidence_score])
                 A.append(new_detection)
-                considerable_detections = [detection for detection in A if detection[-1] > 0.6]
+                considerable_detections = [detection for detection in A if detection[-1] > 0.5]
                 considerable_detections = np.array(considerable_detections)
             A = np.array(A)
             results = []
